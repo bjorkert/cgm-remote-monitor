@@ -1,0 +1,126 @@
+# Build and publish this fork to ghcr.io/bjorkert/nightscout, matching the
+# pattern used by the other bjorkert images (nsgram, cart, lftelemetryapi).
+#
+# Two things differ from those repos on purpose:
+#
+#  1. NO version bump commit. Those repos own their version file; this one is a
+#     fork that keeps merging upstream nightscout/cgm-remote-monitor, and
+#     rewriting package.json in CI would create a conflict on every single
+#     upstream merge. The image is tagged from the version already in
+#     package.json plus the commit SHA instead.
+#
+#  2. Native per-arch runners instead of QEMU. This repo is public, so
+#     ubuntu-24.04-arm is free. Nightscout's `npm ci` builds native modules;
+#     under QEMU emulation the arm64 leg takes the better part of an hour,
+#     versus a few minutes natively. Each arch is built and pushed by digest,
+#     then a merge job stitches them into one multi-arch manifest.
+name: Build and Push Nightscout Image
+
+on:
+  push:
+    # `nils` is the long-lived deploy branch, not master: master tracks upstream
+    # nightscout, while what we actually run is this fork's work merged on top of
+    # dev. Topic branches carrying fixes stay upstream-clean and hold no workflow
+    # of their own; they reach the image by being merged here. Every push to this
+    # branch republishes ghcr.io/bjorkert/nightscout:latest.
+    branches: [nils]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/bjorkert/nightscout
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          # push-by-digest publishes an untagged image; the merge job below is
+          # what creates the human-readable tags. Without this, the two arch
+          # jobs would race and each overwrite the other's :latest.
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        # The stripping has to happen in bash — GitHub Actions expressions do
+        # not support ${var#prefix} parameter expansion.
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version from package.json
+        id: ver
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${IMAGE_NAME}:latest \
+            -t ${IMAGE_NAME}:${{ steps.ver.outputs.version }} \
+            -t ${IMAGE_NAME}:sha-${GITHUB_SHA::7} \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
+
+      - name: Show result
+        run: docker buildx imagetools inspect ${IMAGE_NAME}:latest
