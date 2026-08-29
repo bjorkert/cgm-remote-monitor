@@ -64,6 +64,9 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
+          # Links the ghcr package to this repo, which is what makes GitHub emit
+          # the `package.published` event fluxify listens for.
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           # push-by-digest publishes an untagged image; the merge job below is
           # what creates the human-readable tags. Without this, the two arch
           # jobs would race and each overwrite the other's :latest.
